@@ -1,0 +1,5 @@
+body { font-family: monospace; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+textarea { width: 100%; box-sizing: border-box; font-family: inherit; }
+pre { white-space: pre-wrap; background: #f4f4f4; padding: .5rem; border-radius: 4px; margin: .25rem 0; }
+.dim { color: #888; font-size: .85em; }
+.err { color: #c00; }
