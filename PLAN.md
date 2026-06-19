@@ -1,15 +1,20 @@
 # Plan: PlanAgent — Simple Plan → Execute Agent
 
 ## Context
-Build a **very simple** general-purpose agent that separates a **planning phase** (break a task into ordered steps) from an **execution phase** (run each step with tools). An earlier draft drifted into a three-runtime polyglot system (Python agent + Express/TS bridge + React) communicating over a fragile CLI/subprocess + NDJSON seam. This revision collapses that to the simplest architecture that still delivers a real web UI:
+Build a **very simple** general-purpose agent that separates a **planning phase** (break a task into ordered steps) from an **execution phase** (run each step with tools). The goal is to learn how agents work by building one — specifically to see tool calls streaming into the UI in real time.
 
-- **One backend language (Python)**: FastAPI serves the agent directly — native Pydantic validation and native SSE streaming. The Express tier and the CLI-subprocess bridge are **removed entirely**.
+MVP scope (confirmed intent):
+- **One tool: SearXNG** via a local instance — no API key, no external dependency.
+- **No shell tool, no file I/O** — post-MVP.
+- **No approval toggle** — execution starts automatically after planning.
+- **Streaming execution log** is the core feature: watch each tool call arrive step by step.
+
+Architecture:
+- **One backend language (Python)**: FastAPI serves the agent directly — native Pydantic validation and native SSE streaming.
 - **Thin React frontend** (Vite) talks directly to FastAPI over `fetch` + `EventSource`.
 - **OpenRouter** wired the correct, documented way (no invented `langchain-openrouter` package).
-- **Brave Search** replaces DuckDuckGo.
-- **Approval toggle**: user can review the plan before execution; the plan is **frozen** once approved (no mid-run re-planning).
 
-Intended outcome: clone, set one `.env`, run two commands (`uvicorn` + `npm run dev`), type a task, watch it plan then execute.
+Intended outcome: clone, set one `.env`, run two commands (`uvicorn` + `npm run dev`), type a task, watch it plan then execute with live streaming tool calls.
 
 ---
 
@@ -77,10 +82,9 @@ ChatOpenAI(
 ```
 Confirmed against LangChain docs (OpenAI-compatible endpoint pattern). Keeps the app model-agnostic via `OPENROUTER_MODEL`.
 
-### 4. `agent/tools.py` — restricted by default
-- **Brave web search**: `from langchain_community.tools import BraveSearch` → `BraveSearch.from_api_key(api_key=os.environ["BRAVE_SEARCH_API_KEY"], search_kwargs={"count": 3})`.
-- **Shell**: custom `@tool` wrapping `subprocess.run` with a timeout, `cwd` pinned to `AGENT_WORKSPACE_DIR`, and a command allowlist. **Not** raw `ShellTool`.
-- **File I/O**: custom `read_file` / `write_file` `@tool`s that resolve paths and reject anything escaping `AGENT_WORKSPACE_DIR` (path-traversal guard). **Not** raw `open()`.
+### 4. `agent/tools.py`
+- **SearXNG search**: `from langchain_community.utilities import SearxSearchWrapper` → `SearxSearchWrapper(searx_host=os.environ["SEARXNG_URL"])`, wrapped as a LangChain tool. Points at the local SearXNG instance. No API key needed.
+- Shell and file I/O tools are **out of scope for MVP**.
 
 ### 5. `agent/planner.py` — `PlannerAgent`
 - `llm.with_structured_output(Plan, method="json_schema")`.
@@ -112,8 +116,7 @@ Confirmed against LangChain docs (OpenAI-compatible endpoint pattern). Keeps the
 OPENROUTER_API_KEY=your_key_here
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 OPENROUTER_MODEL=openai/gpt-4o
-BRAVE_SEARCH_API_KEY=your_brave_key_here
-AGENT_WORKSPACE_DIR=./workspace
+SEARXNG_URL=http://localhost:8080
 MAX_STEPS=10
 SERVER_PORT=8000
 VITE_API_BASE_URL=http://localhost:8000
@@ -123,8 +126,9 @@ VITE_API_BASE_URL=http://localhost:8000
 
 ## Key Design Decisions
 - **FastAPI, no Express, no CLI bridge**: one backend language; native Pydantic + native SSE. Removes the riskiest component (subprocess + stdout-NDJSON parsing) from the prior plan.
-- **Plan frozen after approval**: matches the "plan then execute, with optional approval" intent; no mid-run re-planning in the MVP.
-- **Restricted tools by default**: Brave search, allowlisted/timed shell, workspace-scoped file I/O — never raw shell or `open()`.
+- **SearXNG over Brave Search**: local instance, no API key, removes an external dependency for MVP.
+- **No approval toggle in MVP**: execution starts automatically after planning; keeps the flow simple while learning.
+- **One tool only (MVP)**: SearXNG search is enough to see real tool calls streaming; shell and file I/O are post-MVP.
 - **Env-driven, server-side config**: keys and model never touch the client, query string, or shell history.
 - **Per-step agent invocation**: each step's tool use is isolated and individually streamable.
 
@@ -132,14 +136,13 @@ VITE_API_BASE_URL=http://localhost:8000
 
 ## Verification
 1. `pip install -r requirements.txt`
-2. `cp .env.example .env`; set `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `BRAVE_SEARCH_API_KEY`, `AGENT_WORKSPACE_DIR`.
+2. `cp .env.example .env`; set `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `SEARXNG_URL` (default `http://localhost:8080`).
 3. Backend smoke test (no UI):
    - `curl -s localhost:8000/api/health` → `{"ok":true}` after `uvicorn server.app:app --reload`.
    - `curl -s -XPOST localhost:8000/api/plan -H 'content-type: application/json' -d '{"task":"Search the web for the latest Python release and save a summary to summary.txt"}'` → JSON plan with numbered steps.
 4. `cd web && npm install && npm run dev`; open the Vite URL.
-5. End-to-end in the UI with task: *"Search the web for the latest Python release and save a summary to summary.txt"* — verify:
+5. End-to-end in the UI with task: *"Search the web for the latest Python release and summarize what's new"* — verify:
    - plan renders with numbered steps,
-   - approval toggle blocks execution until "Approve & Execute" is clicked (and auto-runs when off),
-   - execution events stream into the log (Brave search call visible),
-   - the written file lands **inside** `AGENT_WORKSPACE_DIR` (path-traversal attempt is rejected),
-   - missing `OPENROUTER_API_KEY` / `BRAVE_SEARCH_API_KEY` produces a clear error, not a hang.
+   - execution starts automatically (no approval step),
+   - SearXNG tool calls stream into the log in real time,
+   - missing `OPENROUTER_API_KEY` or unreachable `SEARXNG_URL` produces a clear error, not a hang.
