@@ -27,8 +27,16 @@ ExecutionEvent = (
 
 
 class ExecutorAgent:
+    _SYSTEM = (
+        "You are executing one step of a plan. Use web_search at most 2 times. "
+        "Stop and respond with your answer as soon as you have usable results. "
+        "Do not keep searching once you have found relevant information."
+    )
+
     def __init__(self) -> None:
-        self._agent = create_react_agent(get_llm(), tools)
+        self._agent = create_react_agent(get_llm(), tools, prompt=self._SYSTEM, checkpointer=False)
+        # ponytail: low recursion limit forces early stop; raise if steps genuinely need more tool calls
+        self._config = {"recursion_limit": 10}
 
     async def stream(self, task: str, plan: Plan) -> AsyncGenerator[ExecutionEvent, None]:
         prior_outputs: list[str] = []
@@ -53,6 +61,7 @@ class ExecutorAgent:
                 async for event in self._agent.astream_events(
                     {"messages": [{"role": "user", "content": prompt}]},
                     version="v2",
+                    config=self._config,
                 ):
                     kind = event["event"]
 
