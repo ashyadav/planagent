@@ -1,3 +1,4 @@
+import Markdown from 'react-markdown'
 import type { ExecutionEvent } from '../api'
 
 export default function ResultCard({ events }: { events: ExecutionEvent[] }) {
@@ -25,7 +26,7 @@ export default function ResultCard({ events }: { events: ExecutionEvent[] }) {
       <strong style={{ color: success ? '#2a7a2a' : '#c00' }}>
         {success ? '✓ Result' : '✗ Failed'}
       </strong>
-      {lastOutput && <p style={{ margin: '.5rem 0 0', whiteSpace: 'pre-wrap' }}>{lastOutput}</p>}
+      {lastOutput && <Markdown>{lastOutput}</Markdown>}
     </div>
   )
 }
