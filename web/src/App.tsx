@@ -3,6 +3,7 @@ import { postPlan, streamExecute } from './api'
 import type { ExecutionEvent, Plan } from './api'
 import ExecutionLog from './components/ExecutionLog'
 import PlanDisplay from './components/PlanDisplay'
+import ResultCard from './components/ResultCard'
 import TaskComposer from './components/TaskComposer'
 
 type State = 'idle' | 'planning' | 'executing' | 'done' | 'error'
@@ -50,7 +51,8 @@ export default function App() {
       <h1 style={{ fontSize: '1.4rem', marginBottom: '1rem' }}>PlanAgent</h1>
       <TaskComposer onSubmit={handleTask} disabled={busy} />
       {state !== 'idle' && <PlanDisplay plan={plan} />}
-      <ExecutionLog events={events} />
+      <ExecutionLog events={events} done={state === 'done' || state === 'error'} />
+      <ResultCard events={events} />
       {error && <p className="err">{error}</p>}
     </div>
   )
