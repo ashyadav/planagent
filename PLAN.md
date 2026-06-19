@@ -1,7 +1,15 @@
-# Plan: PlanAgent — Plan-then-Execute Agent with Web UI
+# Plan: PlanAgent — Simple Plan → Execute Agent
 
 ## Context
-Building a general-purpose AI agent from scratch that explicitly separates the **planning phase** (breaking a user task into steps) from the **execution phase** (running those steps using tools). The user wants a simple web UI, LangChain for model-agnostic orchestration, and OpenRouter as the LLM provider. An optional approval gate lets the user review and confirm the plan before execution begins.
+Build a **very simple** general-purpose agent that separates a **planning phase** (break a task into ordered steps) from an **execution phase** (run each step with tools). An earlier draft drifted into a three-runtime polyglot system (Python agent + Express/TS bridge + React) communicating over a fragile CLI/subprocess + NDJSON seam. This revision collapses that to the simplest architecture that still delivers a real web UI:
+
+- **One backend language (Python)**: FastAPI serves the agent directly — native Pydantic validation and native SSE streaming. The Express tier and the CLI-subprocess bridge are **removed entirely**.
+- **Thin React frontend** (Vite) talks directly to FastAPI over `fetch` + `EventSource`.
+- **OpenRouter** wired the correct, documented way (no invented `langchain-openrouter` package).
+- **Brave Search** replaces DuckDuckGo.
+- **Approval toggle**: user can review the plan before execution; the plan is **frozen** once approved (no mid-run re-planning).
+
+Intended outcome: clone, set one `.env`, run two commands (`uvicorn` + `npm run dev`), type a task, watch it plan then execute.
 
 ---
 
@@ -11,75 +19,127 @@ Building a general-purpose AI agent from scratch that explicitly separates the *
 planagent/
 ├── agent/
 │   ├── __init__.py
-│   ├── planner.py      # Generates structured plan from user task
-│   ├── executor.py     # Runs each plan step using tools + LangChain agent
-│   └── tools.py        # Tool definitions (web search, shell, file I/O)
-├── ui/
-│   └── app.py          # Streamlit web UI
+│   ├── schemas.py      # Pydantic: Plan, PlanStep, ExecutionEvent
+│   ├── llm.py          # OpenRouter ChatOpenAI factory (env-driven)
+│   ├── tools.py        # Brave search + restricted shell + workspace file I/O
+│   ├── planner.py      # PlannerAgent: task -> Plan (structured output)
+│   └── executor.py     # ExecutorAgent: Plan -> stream of ExecutionEvents
+├── server/
+│   └── app.py          # FastAPI: /api/plan, /api/execute (SSE), /api/health
+├── web/
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── index.html
+│   └── src/
+│       ├── main.tsx
+│       ├── App.tsx     # state machine: idle→planning→reviewing→executing→done/error
+│       ├── api.ts      # typed fetch + EventSource wrappers
+│       └── components/{TaskComposer,PlanReview,ExecutionLog}.tsx
 ├── requirements.txt
 └── .env.example
 ```
 
+One Python process is the whole backend. React is the only other runtime, and only because it's a real UI.
+
 ---
 
-## Implementation Plan
+## Implementation
 
 ### 1. `requirements.txt`
 ```
 langchain
 langchain-openai
 langchain-community
-streamlit
-duckduckgo-search
+langgraph
+fastapi
+uvicorn[standard]
+sse-starlette
 python-dotenv
+pydantic
 ```
+No `langchain-openrouter` (does not exist). No `duckduckgo-search`.
 
-### 2. `agent/tools.py`
-Define three LangChain tools:
-- **Web search**: `DuckDuckGoSearchRun` from `langchain_community.tools`
-- **Shell execution**: `ShellTool` from `langchain_community.tools`
-- **File I/O**: two simple custom tools — `ReadFileTool` and `WriteFileTool` wrapping Python `open()`
+### 2. `agent/schemas.py`
+- `PlanStep`: `{ step: int (>=1), description: str (non-empty) }`
+- `Plan`: `{ steps: list[PlanStep] }` — validators: ≥1 step, ≤ `MAX_STEPS` (env, default 10), step numbers positive and contiguous.
+- `ExecutionEvent`: discriminated union with `type` in `{step_started, tool_started, tool_finished, step_finished, error, execution_finished}` plus a JSON-serializable `data` payload. Used for SSE.
 
-### 3. `agent/planner.py` — `PlannerAgent`
-- Takes a user task string
-- Calls the LLM once with a structured prompt instructing it to return a numbered JSON list of steps: `[{"step": 1, "description": "..."}]`
-- Uses `langchain_openai.ChatOpenAI` pointed at OpenRouter (`openai_api_base="https://openrouter.ai/api/v1"`)
-- Returns a `Plan` dataclass: `list[PlanStep]`
+### 3. `agent/llm.py`
+Single factory so config lives in one place:
+```python
+from langchain_openai import ChatOpenAI
+ChatOpenAI(
+    base_url=os.environ["OPENROUTER_BASE_URL"],
+    api_key=os.environ["OPENROUTER_API_KEY"],
+    model=os.environ["OPENROUTER_MODEL"],
+    temperature=0,
+)
+```
+Confirmed against LangChain docs (OpenAI-compatible endpoint pattern). Keeps the app model-agnostic via `OPENROUTER_MODEL`.
 
-### 4. `agent/executor.py` — `ExecutorAgent`
-- Takes a `Plan` and executes each step using a LangChain ReAct agent with the tools from `tools.py`
-- Yields `(step_index, output)` tuples so the UI can stream progress step by step
-- Each step is a separate agent invocation with the step description as the task
+### 4. `agent/tools.py` — restricted by default
+- **Brave web search**: `from langchain_community.tools import BraveSearch` → `BraveSearch.from_api_key(api_key=os.environ["BRAVE_SEARCH_API_KEY"], search_kwargs={"count": 3})`.
+- **Shell**: custom `@tool` wrapping `subprocess.run` with a timeout, `cwd` pinned to `AGENT_WORKSPACE_DIR`, and a command allowlist. **Not** raw `ShellTool`.
+- **File I/O**: custom `read_file` / `write_file` `@tool`s that resolve paths and reject anything escaping `AGENT_WORKSPACE_DIR` (path-traversal guard). **Not** raw `open()`.
 
-### 5. `ui/app.py` — Streamlit UI
-Layout:
-1. **Sidebar**: model selector (dropdown, defaults to `openai/gpt-4o`), approval toggle checkbox
-2. **Main area**:
-   - Text area: "Describe your task"
-   - "Generate Plan" button → calls `PlannerAgent`, renders plan as numbered list
-   - If approval toggle ON: "Approve & Execute" button; if OFF: auto-executes after plan renders
-   - Execution output: expander per step showing the agent's tool calls and final answer
-   - Stream output using `st.write_stream` or `st.empty()` + generator
+### 5. `agent/planner.py` — `PlannerAgent`
+- `llm.with_structured_output(Plan, method="json_schema")`.
+- System prompt: decompose the task into a minimal ordered list of concrete, executable steps; no commentary.
+- Returns a validated `Plan`. Raises on empty/oversized plans (schema enforces).
 
-### 6. `.env.example`
+### 6. `agent/executor.py` — `ExecutorAgent`
+- Builds a tool-calling agent via LangGraph `create_react_agent(model, tools)`.
+- Iterates the **frozen** approved plan in order; each step is its own agent invocation with prior step outputs passed as context.
+- `async` generator yielding `ExecutionEvent`s (step_started → tool_started/finished → step_finished …).
+- On unrecoverable step failure: emit `error` event and stop; always end with `execution_finished`.
+
+### 7. `server/app.py` — FastAPI
+- `GET /api/health` → `{ "ok": true }`.
+- `POST /api/plan` body `{ task }` → `{ plan }` (Pydantic validates in/out).
+- `POST /api/execute` body `{ task, plan }` → **SSE** stream (`sse-starlette` `EventSourceResponse`) of `ExecutionEvent`s; cancels the generator if the client disconnects.
+- Secrets/model config stay server-side via `.env`; never accepted from the client.
+- CORS allows the Vite dev origin.
+
+### 8. `web/` — thin React (Vite + TS)
+- `api.ts`: `postPlan(task)` and `streamExecute(task, plan, onEvent)` (EventSource).
+- `App.tsx`: state machine `idle → planning → reviewing → executing → done/error`; holds the approval toggle.
+- `TaskComposer`: textarea + "Generate Plan" + approval toggle.
+- `PlanReview`: numbered steps; if approval ON show "Approve & Execute", else auto-start execution on plan arrival.
+- `ExecutionLog`: appends streamed events grouped by step, with tool calls and final output; loading/error states.
+
+### 9. `.env.example`
 ```
 OPENROUTER_API_KEY=your_key_here
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_MODEL=openai/gpt-4o
+BRAVE_SEARCH_API_KEY=your_brave_key_here
+AGENT_WORKSPACE_DIR=./workspace
+MAX_STEPS=10
+SERVER_PORT=8000
+VITE_API_BASE_URL=http://localhost:8000
 ```
 
 ---
 
 ## Key Design Decisions
-- **No agent framework** beyond LangChain core — keeps it simple and transparent
-- **Streamlit** for the UI — zero frontend code, fast to build, works great for streaming text
-- **Approval flag** is a UI toggle (checkbox), not a CLI flag, since the interface is web-based
-- **ReAct agent per step** (not one agent for the whole plan) — makes each step's tool use isolated and visible
+- **FastAPI, no Express, no CLI bridge**: one backend language; native Pydantic + native SSE. Removes the riskiest component (subprocess + stdout-NDJSON parsing) from the prior plan.
+- **Plan frozen after approval**: matches the "plan then execute, with optional approval" intent; no mid-run re-planning in the MVP.
+- **Restricted tools by default**: Brave search, allowlisted/timed shell, workspace-scoped file I/O — never raw shell or `open()`.
+- **Env-driven, server-side config**: keys and model never touch the client, query string, or shell history.
+- **Per-step agent invocation**: each step's tool use is isolated and individually streamable.
 
 ---
 
 ## Verification
 1. `pip install -r requirements.txt`
-2. Copy `.env.example` → `.env`, add OpenRouter API key
-3. `streamlit run ui/app.py`
-4. Enter a task like "Search the web for the latest Python release and save a summary to output.txt"
-5. Verify: plan renders with numbered steps, approval toggle blocks execution until clicked, each step shows tool calls + output
+2. `cp .env.example .env`; set `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `BRAVE_SEARCH_API_KEY`, `AGENT_WORKSPACE_DIR`.
+3. Backend smoke test (no UI):
+   - `curl -s localhost:8000/api/health` → `{"ok":true}` after `uvicorn server.app:app --reload`.
+   - `curl -s -XPOST localhost:8000/api/plan -H 'content-type: application/json' -d '{"task":"Search the web for the latest Python release and save a summary to summary.txt"}'` → JSON plan with numbered steps.
+4. `cd web && npm install && npm run dev`; open the Vite URL.
+5. End-to-end in the UI with task: *"Search the web for the latest Python release and save a summary to summary.txt"* — verify:
+   - plan renders with numbered steps,
+   - approval toggle blocks execution until "Approve & Execute" is clicked (and auto-runs when off),
+   - execution events stream into the log (Brave search call visible),
+   - the written file lands **inside** `AGENT_WORKSPACE_DIR` (path-traversal attempt is rejected),
+   - missing `OPENROUTER_API_KEY` / `BRAVE_SEARCH_API_KEY` produces a clear error, not a hang.
