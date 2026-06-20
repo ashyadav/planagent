@@ -50,7 +50,7 @@ export default function App() {
     <div style={{ padding: '1rem' }}>
       <h1 style={{ fontSize: '1.4rem', marginBottom: '1rem' }}>PlanAgent</h1>
       <TaskComposer onSubmit={handleTask} disabled={busy} />
-      {state !== 'idle' && <PlanDisplay plan={plan} />}
+      {state !== 'idle' && <PlanDisplay plan={plan} done={state === 'done' || state === 'error'} />}
       <ExecutionLog events={events} done={state === 'done' || state === 'error'} />
       <ResultCard events={events} />
       {error && <p className="err">{error}</p>}
